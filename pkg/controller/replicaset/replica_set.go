@@ -38,6 +38,7 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -641,6 +642,42 @@ func (rsc *ReplicaSetController) manageReplicas(filteredPods []*v1.Pod, rs *apps
 	return nil
 }
 
+func (rsc *ReplicaSetController) inplaceUpdate(filteredPods []*v1.Pod, rs *apps.ReplicaSet) error {
+	for _, pod := range filteredPods {
+		podCopy := pod.DeepCopy()
+		podContainers := podCopy.Spec.Containers
+		rsContainers := rs.Spec.Template.Spec.Containers
+
+		if len(podContainers) != len(rsContainers) {
+			klog.Infof("InplaceUpdate: Replicaset %s containers num has changed", rs.Name)
+			return nil
+		}
+
+		if apiequality.Semantic.DeepEqual(podContainers, rsContainers) {
+			klog.Infof("InplaceUpdate: Replicaset %s nothing to do", rs.Name)
+			return nil
+		}
+
+		for i := range rsContainers {
+			podContainers[i].Image = rsContainers[i].Image
+		}
+
+		// TODO: compare pod with replicaset to ensure only image changed
+		/*
+			if !apiequality.Semantic.DeepEqual(podContainers, rsContainers) {
+				klog.Infof("InplaceUpdate: Replicaset %s not only change container image", rs.Name)
+				return nil
+			}
+		*/
+
+		_, err := rsc.kubeClient.CoreV1().Pods(rs.Namespace).Update(context.TODO(), podCopy, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // syncReplicaSet will sync the ReplicaSet with the given key if it has had its expectations fulfilled,
 // meaning it did not expect to see any more of its pods created or deleted. This function is not meant to be
 // invoked concurrently with the same key.
@@ -685,6 +722,11 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 	// modify them, you need to copy it first.
 	filteredPods, err = rsc.claimPods(rs, selector, filteredPods)
 	if err != nil {
+		return err
+	}
+
+	if err := rsc.inplaceUpdate(filteredPods, rs); err != nil {
+		klog.Infof("InplaceUpdate: Replicaset %s failed to inplace update: %v", rs.Name, err)
 		return err
 	}
 

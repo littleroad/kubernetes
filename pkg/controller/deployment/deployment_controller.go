@@ -30,6 +30,7 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -558,6 +559,41 @@ func (dc *DeploymentController) getPodMapForDeployment(d *apps.Deployment, rsLis
 	return podMap, nil
 }
 
+func (dc *DeploymentController) inplaceUpdate(d *apps.Deployment, rsList []*apps.ReplicaSet) (bool, error) {
+	klog.Infof("InplaceUpdate: try to inplace update %s", d.Name)
+	activeRSs := controller.FilterActiveReplicaSets(rsList)
+	if l := len(activeRSs); l != 1 {
+		klog.Infof("InplaceUpdate: Deployment %s has %d active replicasets", d.Name, l)
+		return false, nil
+	}
+
+	rsCopy := activeRSs[0].DeepCopy()
+	rsPodSpec := rsCopy.Spec.Template.Spec
+	deployPodSpec := d.Spec.Template.Spec
+
+	if len(rsPodSpec.Containers) != len(deployPodSpec.Containers) {
+		klog.Infof("InplaceUpdate: Deployment %s containers num has changed", d.Name)
+		return false, nil
+	}
+
+	if apiequality.Semantic.DeepEqual(rsPodSpec, deployPodSpec) {
+		klog.Infof("InplaceUpdate: Deployment %s nothing to do", d.Name)
+		return true, nil
+	}
+
+	for i := range deployPodSpec.Containers {
+		rsPodSpec.Containers[i].Image = deployPodSpec.Containers[i].Image
+	}
+
+	if !apiequality.Semantic.DeepEqual(rsPodSpec, deployPodSpec) {
+		klog.Infof("InplaceUpdate: Deployment %s not only change container image", d.Name)
+		return false, nil
+	}
+
+	_, err := dc.client.AppsV1().ReplicaSets(rsCopy.Namespace).Update(context.TODO(), rsCopy, metav1.UpdateOptions{})
+	return true, err
+}
+
 // syncDeployment will sync the deployment with the given key.
 // This function is not meant to be invoked concurrently with the same key.
 func (dc *DeploymentController) syncDeployment(key string) error {
@@ -640,6 +676,14 @@ func (dc *DeploymentController) syncDeployment(key string) error {
 		return dc.sync(d, rsList)
 	}
 
+	if inplaceUpdateFlag, err := dc.inplaceUpdate(d, rsList); inplaceUpdateFlag {
+		if err != nil {
+			klog.Infof("InplaceUpdate: Deployment %s inplace update failed: %v", d.Name, err)
+		}
+		return err
+	}
+
+	klog.Infof("InplaceUpdate: Deployment %s start to rolling update or recreate", d.Name)
 	switch d.Spec.Strategy.Type {
 	case apps.RecreateDeploymentStrategyType:
 		return dc.rolloutRecreate(d, rsList, podMap)
